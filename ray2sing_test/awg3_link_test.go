@@ -18,7 +18,7 @@ func TestWgLinkAwg3(t *testing.T) {
 		"&public_key="+pub+"&persistent_keepalive_interval=25#%F0%9F%87%B5%F0%9F%87%B1%20Amnezia")
 	wantAll(t, got, `"type":"awg"`, `"address":"10.8.1.2/32"`, `"mtu":1280`,
 		`"public_key":"EdvQI284oYKlm6YqUXn4gd6wWqZC+HAsJQCmm9+GdRQ="`,
-		`"persistent_keepalive_interval":25`,
+		`"persistent_keepalive_interval":"25"`,
 		`"jc":4`, `"s4":17`, `"h4":"1988128689"`, `"i1":"<r 240>"`,
 		`"header_protection_key":"5c6d7e82929c094ce3ff4dce2b1a1706eb1f53009c66ce55fefdb4a4922cbcfb"`,
 		`"content_padding_addition":"9-33"`, `"rekey_after_time":"112-151"`, `"rekey_timeout":"6-10"`,

@@ -2,10 +2,12 @@ package ray2sing
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	T "github.com/sagernet/sing-box/option"
 )
@@ -24,19 +26,21 @@ func fetchSSConf(parsedURL *url.URL) ([]byte, error) {
 	// Construct the HTTP URL
 	httpURL := "https://" + parsedURL.Host + parsedURL.Path
 
-	// Make the HTTP request
-	resp, err := http.Get(httpURL)
+	// hardened: a timeout and a size limit, a hung or endless answer held the parser (HC-16)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(httpURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20+1))
 	if err != nil {
 		return nil, err
 	}
-
+	if len(body) > 4<<20 {
+		return nil, errors.New("ssconf: answer larger than 4 MiB")
+	}
 	return body, nil
 }
 func parseAndFetchBeePass(body []byte) (*beepassData, error) {

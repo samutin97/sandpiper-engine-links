@@ -109,7 +109,7 @@ func amneziaWireGuardEndpoint(tag string, wg T.WireGuardEndpointOptions, awg T.A
 			PublicKey:                   peer.PublicKey,
 			PresharedKey:                peer.PreSharedKey,
 			AllowedIPs:                  badoption.Listable[netip.Prefix](peer.AllowedIPs),
-			PersistentKeepaliveInterval: peer.PersistentKeepaliveInterval,
+			PersistentKeepaliveInterval: awgKeepalive(peer.PersistentKeepaliveInterval),
 		})
 	}
 	return &T.Endpoint{Type: C.TypeAwg, Tag: tag, Options: &opts}
@@ -211,4 +211,12 @@ func awgValue(key string, value any) any {
 		}
 	}
 	return value
+}
+
+// awgKeepalive is a WireGuard keepalive as an AmneziaWG one (0 is off).
+func awgKeepalive(seconds uint16) T.AwgRange {
+	if seconds == 0 {
+		return ""
+	}
+	return T.AwgRange(strconv.FormatUint(uint64(seconds), 10))
 }

@@ -66,6 +66,7 @@ var endpointParsers = map[string]EndpointParserFunc{
 	"awg://":       AWGSingbox,
 	"[Interface]":  AWGSingboxTxt,
 	"ovpn://":      OpenVPNSingbox,
+	"vpn://":       AmneziaVPNSingbox, // AmneziaVPN keys (hardened)
 }
 var xrayConfigTypes = map[string]ParserFunc{
 	"vmess://":  VmessXray,
@@ -183,7 +184,8 @@ func GenerateConfigLite(input string, useXrayWhenPossible bool) (*option.Options
 			outend, err := processSingleConfig(chain, useXrayWhenPossible)
 
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error in %s \n %v\n", config, err)
+				// hardened: the error only; the profile holds keys and passwords (HC-15)
+				fmt.Fprintf(os.Stderr, "ray2sing: a link was skipped: %v\n", err)
 
 				continue
 			}
@@ -265,7 +267,7 @@ func Ray2SingboxOptions(ctx context.Context, configs string, useXrayWhenPossible
 			stackTrace := make([]byte, 1024)
 			s := runtime.Stack(stackTrace, false)
 			stackStr := fmt.Sprint(string(stackTrace[:s]))
-			err = E.New("Error in Parsing", configs, r, "Stack trace:", stackStr)
+			err = E.New("Error in Parsing: ", r, " Stack trace:", stackStr) // hardened: not the profile itself (HC-15)
 
 		}
 	}()

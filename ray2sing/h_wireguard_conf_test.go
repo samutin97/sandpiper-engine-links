@@ -22,7 +22,7 @@ func TestWireGuardConfNameAndRule(t *testing.T) {
 	for i, name := range []string{"home", "second"} {
 		endpoint := options.Endpoints[i]
 		awg := endpoint.Options.(*T.AwgEndpointOptions)
-		if !strings.HasPrefix(endpoint.Tag, name+" § ") || awg.Peers[0].PersistentKeepaliveInterval != 25 {
+		if !strings.HasPrefix(endpoint.Tag, name+" § ") || awg.Peers[0].PersistentKeepaliveInterval != "25" {
 			t.Fatalf("%s: %+v", endpoint.Tag, awg.Peers)
 		}
 	}

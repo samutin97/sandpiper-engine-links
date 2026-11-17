@@ -91,7 +91,7 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 		Enabled:    true,
 		ServerName: serverName,
 		Insecure:   insecure == "true" || insecure == "1",
-		DisableSNI: getOneOfN(decoded, "", "nosni") != "",
+		DisableSNI: toBool(getOneOfN(decoded, "", "nosni"), false), // "nosni=0" turned it on
 		ECH:        ECHOpts,
 		// TLSTricks:  getTricksOptions(decoded),
 	}
@@ -107,11 +107,7 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 		if net == "" {
 			net = getOneOfN(decoded, "type")
 		}
-		if net == "httpupgrade" || net == "ws" || net == "grpc" || net == "h2" {
-			tlsOptions.ALPN = []string{"h2", "http/1.1"}
-		} else {
-			tlsOptions.ALPN = strings.Split(alpn, ",")
-		}
+		tlsOptions.ALPN = transportALPN(net, alpn)
 	}
 	// uTLS breaks QUIC/h3 (xhttp QUIC and similar); never enable fingerprint when ALPN is h3.
 	useUTLS := fp != "" && !tlsOptions.DisableSNI && getALPNversion(tlsOptions.ALPN) != 3
@@ -125,6 +121,52 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 		TLS: tlsOptions,
 	}
 
+}
+
+// mergeXHTTPBase is base with every field nested sets laid over it (through their JSON, so every
+// field of the options counts, not a few named ones).
+func mergeXHTTPBase(base, nested option.V2RayXHTTPBaseOptions) option.V2RayXHTTPBaseOptions {
+	var merged map[string]any
+	if b, err := json.Marshal(base); err == nil {
+		json.Unmarshal(b, &merged)
+	}
+	if merged == nil {
+		merged = map[string]any{}
+	}
+	var over map[string]any
+	if b, err := json.Marshal(nested); err == nil {
+		json.Unmarshal(b, &over)
+	}
+	for k, v := range over {
+		merged[k] = v
+	}
+	result := base
+	if b, err := json.Marshal(merged); err == nil {
+		var out option.V2RayXHTTPBaseOptions
+		if json.Unmarshal(b, &out) == nil {
+			result = out
+		}
+	}
+	return result
+}
+
+// transportALPN is the ALPN the transport speaks (HC-12): WebSocket and HTTPUpgrade are HTTP/1.1
+// upgrades, and offering h2 lets a front (nginx, HAProxy, a CDN) pick h2, which breaks them; gRPC
+// and h2 are HTTP/2 only. Other transports take the link's list.
+func transportALPN(network, alpn string) []string {
+	switch strings.ToLower(network) {
+	case "ws", "websocket", "httpupgrade":
+		return []string{"http/1.1"}
+	case "grpc", "gun", "h2", "http":
+		return []string{"h2"}
+	}
+	var list []string
+	for _, item := range strings.Split(alpn, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			list = append(list, item)
+		}
+	}
+	return list
 }
 
 // parseCipherSuites keeps the names sing-box knows (Go's secure suites), as Xray skips a name it does not know:
@@ -373,15 +415,12 @@ func getTransportOptions(decoded map[string]string) (*option.V2RayTransportOptio
 			}
 			if dl := x.DownloadSettings; dl != nil {
 				if dl.XHTTPSettings != nil {
-					if dl.XHTTPSettings.Path != "" {
-						dl.Path = dl.XHTTPSettings.Path
-					}
-					if dl.XHTTPSettings.Host != "" {
-						dl.Host = dl.XHTTPSettings.Host
-					}
-					if len(dl.XHTTPSettings.Headers) > 0 {
-						dl.Headers = dl.XHTTPSettings.Headers
-					}
+					// the whole xhttpSettings of the download leg (padding, headers, mode
+					// options...), not only path, host and headers (HC-23)
+					dl.V2RayXHTTPBaseOptions = mergeXHTTPBase(dl.V2RayXHTTPBaseOptions, *dl.XHTTPSettings)
+				}
+				if dl.Port < 0 || dl.Port > 65535 {
+					return nil, fmt.Errorf("xhttp downloadSettings: port %d out of range", dl.Port)
 				}
 				transportOptions.XHTTPOptions.Download = &option.V2RayXHTTPDownloadOptions{
 					V2RayXHTTPBaseOptions: dl.V2RayXHTTPBaseOptions,
@@ -393,7 +432,27 @@ func getTransportOptions(decoded map[string]string) (*option.V2RayTransportOptio
 				if transportOptions.XHTTPOptions.Download.Path == "" {
 					transportOptions.XHTTPOptions.Download.Path = path
 				}
-				if dl.Security == "tls" && dl.TLSSettings != nil {
+				// The download leg is TLS when it says so, even without tlsSettings (it went out
+				// as plain HTTP then), and when it says nothing it takes the main leg's TLS or
+				// REALITY; only an explicit security "none" is plain (HC-23).
+				switch strings.ToLower(dl.Security) {
+				case "":
+					if main := getTLSOptions(decoded).TLS; main != nil {
+						inherited := *main
+						transportOptions.XHTTPOptions.Download.TLS = &inherited
+					}
+				case "tls":
+					if dl.TLSSettings == nil {
+						dl.TLSSettings = &TLSConfig{}
+					}
+				}
+				if strings.EqualFold(dl.Security, "tls") && dl.TLSSettings != nil {
+					if dl.TLSSettings.ServerName == "" {
+						dl.TLSSettings.ServerName = getTLSServerName(decoded)
+					}
+					if dl.TLSSettings.Fingerprint == "" {
+						dl.TLSSettings.Fingerprint = decoded["fp"]
+					}
 					transportOptions.XHTTPOptions.Download.TLS = &option.OutboundTLSOptions{
 						Enabled:    true,
 						ALPN:       dl.TLSSettings.ALPN,
@@ -423,11 +482,14 @@ func getTransportOptions(decoded map[string]string) (*option.V2RayTransportOptio
 					if dl.REALITYSettings.KeyShare == "" {
 						transportOptions.XHTTPOptions.Download.TLS.Reality.KeyShare = getRealityKeyShare(decoded)
 					}
-					if dl.REALITYSettings.Fingerprint != "" {
-						transportOptions.XHTTPOptions.Download.TLS.UTLS = &option.OutboundUTLSOptions{
-							Enabled:     true,
-							Fingerprint: dl.REALITYSettings.Fingerprint,
-						}
+					// REALITY works only with uTLS: without a fingerprint the leg was not created
+					fingerprint := dl.REALITYSettings.Fingerprint
+					if fingerprint == "" {
+						fingerprint = "chrome"
+					}
+					transportOptions.XHTTPOptions.Download.TLS.UTLS = &option.OutboundUTLSOptions{
+						Enabled:     true,
+						Fingerprint: fingerprint,
 					}
 				}
 

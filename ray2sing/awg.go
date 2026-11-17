@@ -36,227 +36,254 @@ func awgHeaderProtectionKey(s string) string {
 }
 
 // setAwg3Option sets an AmneziaWG 3.x value from a normalized key (see normalizeStr), as a link
-// or a .conf writes it. It returns false for any other key.
+// writes it. It returns false for any other key; a value it cannot read is left unset.
 func setAwg3Option(awg *T.AwgOptions, key, value string) bool {
+	known, _ := setAwg3OptionErr(awg, key, value)
+	return known
+}
+
+// setAwg3OptionErr is setAwg3Option with the error of a value it cannot read.
+func setAwg3OptionErr(awg *T.AwgOptions, key, value string) (bool, error) {
 	value = strings.TrimSpace(value)
+	ranges := map[string]*T.AwgRange{
+		"contentpaddingaddition": &awg.ContentPaddingAddition,
+		"rekeyaftertime":         &awg.RekeyAfterTime,
+		"rekeytimeout":           &awg.RekeyTimeout,
+		"rejectaftertime":        &awg.RejectAfterTime,
+		"keepalivetimeout":       &awg.KeepaliveTimeout,
+		"maxhandshakeattempts":   &awg.MaxHandshakeAttempts,
+	}
+	if target, ok := ranges[key]; ok {
+		v, err := awgRangeValue(value)
+		if err != nil {
+			return true, fmt.Errorf("invalid %s: %w", key, err)
+		}
+		*target = T.AwgRange(v)
+		return true, nil
+	}
 	switch key {
 	case "headerprotectionkey":
 		awg.HeaderProtectionKey = awgHeaderProtectionKey(value)
-	case "contentpaddingaddition":
-		awg.ContentPaddingAddition = T.AwgRange(value)
-	case "rekeyaftertime":
-		awg.RekeyAfterTime = T.AwgRange(value)
-	case "rekeytimeout":
-		awg.RekeyTimeout = T.AwgRange(value)
-	case "rejectaftertime":
-		awg.RejectAfterTime = T.AwgRange(value)
-	case "keepalivetimeout":
-		awg.KeepaliveTimeout = T.AwgRange(value)
-	case "maxhandshakeattempts":
-		awg.MaxHandshakeAttempts = T.AwgRange(value)
-	case "randomtrailers":
-		awg.RandomTrailers, _ = strconv.ParseBool(value)
-	case "disablecookies":
-		awg.DisableCookies, _ = strconv.ParseBool(value)
+	case "randomtrailers", "disablecookies":
+		b, err := parseAwgBool(value)
+		if err != nil {
+			return true, fmt.Errorf("invalid %s: %w", key, err)
+		}
+		if key == "randomtrailers" {
+			awg.RandomTrailers = b
+		} else {
+			awg.DisableCookies = b
+		}
 	default:
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
+// parseAwgBool reads a boolean of a .conf or a link as amneziawg-tools does: on/off, yes/no,
+// true/false, 1/0, in any case. RandomTrailers = on became false with strconv.ParseBool, and
+// the handshake with a 3.1 server then failed (HC-01).
+func parseAwgBool(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on", "yes", "true", "1":
+		return true, nil
+	case "off", "no", "false", "0", "":
+		return false, nil
+	}
+	return false, fmt.Errorf("not a boolean: %q", value)
+}
+
+// awgRangeValue is a number or "min-max" as the UAPI reads it: the spaces of "1 - 2" removed.
+func awgRangeValue(value string) (string, error) {
+	value = strings.ReplaceAll(strings.TrimSpace(value), " ", "")
+	if value == "" {
+		return "", nil
+	}
+	from, to, isRange := strings.Cut(value, "-")
+	if _, err := strconv.ParseUint(from, 10, 32); err != nil {
+		return "", fmt.Errorf("not a number or a range: %q", value)
+	}
+	if isRange {
+		if _, err := strconv.ParseUint(to, 10, 32); err != nil {
+			return "", fmt.Errorf("not a number or a range: %q", value)
+		}
+	}
+	return value, nil
+}
+
+// confValue is a .conf value without its trailing comment ("Jc = 4 # junk").
+func confValue(value string) string {
+	if i := strings.Index(value, "#"); i >= 0 {
+		value = value[:i]
+	}
+	return strings.TrimSpace(value)
+}
+
+// AWGSingboxTxt reads a WireGuard or AmneziaWG .conf (awg-quick): keys in any case, comments at
+// the end of a line, every [Peer], and every AmneziaWG 3.1 value. A value it cannot read is an
+// error, not a silent 0 (HC-01, HC-45).
 func AWGSingboxTxt(content string) (*T.Endpoint, error) {
-
 	var (
-		privateKey                         string
-		mtu                                uint32
-		addresses                          []netip.Prefix
-		jc, jmin, jmax                     int
-		s1, s2, s3, s4                     int
-		h1, h2, h3, h4, i1, i2, i3, i4, i5 string
-
-		peer     T.AwgPeerOptions
-		reserved []uint8
-		awg3     T.AwgOptions // the AmneziaWG 3.x values
+		privateKey string
+		mtu        uint32
+		addresses  []netip.Prefix
+		awg        T.AwgOptions
+		peers      []T.WireGuardPeer
+		keepalives []T.AwgRange
+		reserved   []uint8
 	)
-
 	section := ""
 	name := ""
-
-	lines := strings.Split(content, "\n")
-	for _, raw := range lines {
+	atoi := func(key, value string) (int, error) {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s: %q", key, value)
+		}
+		return n, nil
+	}
+	headers := map[string]*string{"h1": &awg.H1, "h2": &awg.H2, "h3": &awg.H3, "h4": &awg.H4}
+	ipackets := map[string]*string{"i1": &awg.I1, "i2": &awg.I2, "i3": &awg.I3, "i4": &awg.I4, "i5": &awg.I5}
+	ints := map[string]*int{"jc": &awg.Jc, "jmin": &awg.Jmin, "jmax": &awg.Jmax, "s1": &awg.S1, "s2": &awg.S2, "s3": &awg.S3, "s4": &awg.S4}
+	for _, raw := range strings.Split(content, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-
-		// Section header
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.ToLower(strings.Trim(line, "[]"))
+			section = strings.ToLower(strings.TrimSpace(strings.Trim(line, "[]")))
+			if section == "peer" {
+				peers = append(peers, T.WireGuardPeer{})
+				keepalives = append(keepalives, "")
+			}
 			continue
 		}
-
-		// key = value
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		key := strings.TrimSpace(parts[0])
+		key := normalizeStr(parts[0])
 		val := strings.TrimSpace(parts[1])
-
+		if key != "name" { // a tunnel name may hold a "#"
+			val = confValue(val)
+		}
+		var err error
 		switch section {
 		case "interface":
+			if target, ok := ints[key]; ok {
+				*target, err = atoi(parts[0], val)
+				break
+			}
+			if target, ok := headers[key]; ok {
+				*target, err = awgRangeValue(val)
+				break
+			}
+			if target, ok := ipackets[key]; ok {
+				*target = val
+				break
+			}
 			switch key {
-			case "Name": // the "# Name" comment, see confNamePattern
+			case "name": // the "# Name" comment, see confNamePattern
 				name = val
-			case "PrivateKey":
+			case "privatekey":
 				privateKey = val
-			case "MTU":
-				v, _ := strconv.Atoi(val)
-				mtu = uint32(v)
-
-			case "Address":
+			case "mtu":
+				var v int
+				if v, err = atoi("MTU", val); err == nil {
+					mtu = uint32(v)
+				}
+			case "address":
 				for _, add := range strings.Split(val, ",") {
-					pfx, err := netip.ParsePrefix(strings.TrimSpace(add))
-					if err != nil {
-						return nil, fmt.Errorf("invalid Address: %w", err)
+					if add = strings.TrimSpace(add); add == "" {
+						continue
+					}
+					pfx, perr := netip.ParsePrefix(add)
+					if perr != nil {
+						addr, aerr := netip.ParseAddr(add)
+						if aerr != nil {
+							return nil, fmt.Errorf("invalid Address: %w", perr)
+						}
+						pfx = netip.PrefixFrom(addr, addr.BitLen())
 					}
 					addresses = append(addresses, pfx)
 				}
-			case "Jc":
-				jc, _ = strconv.Atoi(val)
-			case "Jmin":
-				jmin, _ = strconv.Atoi(val)
-			case "Jmax":
-				jmax, _ = strconv.Atoi(val)
-
-			case "S1":
-				s1, _ = strconv.Atoi(val)
-			case "S2":
-				s2, _ = strconv.Atoi(val)
-			case "S3":
-				s3, _ = strconv.Atoi(val)
-			case "S4":
-				s4, _ = strconv.Atoi(val)
-			case "H1":
-				h1 = val
-			case "H2":
-				h2 = val
-			case "H3":
-				h3 = val
-			case "H4":
-				h4 = val
-			case "I1":
-				i1 = val
-			case "I2":
-				i2 = val
-			case "I3":
-				i3 = val
-			case "I4":
-				i4 = val
-			case "I5":
-				i5 = val
 			default:
-				setAwg3Option(&awg3, normalizeStr(key), val)
+				_, err = setAwg3OptionErr(&awg, key, val)
 			}
-
 		case "peer":
+			if len(peers) == 0 {
+				continue
+			}
+			peer := &peers[len(peers)-1]
 			switch key {
-			case "PublicKey":
+			case "publickey":
 				peer.PublicKey = val
-			case "PresharedKey":
-				peer.PresharedKey = val
-
-			case "AllowedIPs":
+			case "presharedkey":
+				peer.PreSharedKey = val
+			case "allowedips":
 				for _, ip := range strings.Split(val, ",") {
-					pfx, err := netip.ParsePrefix(strings.TrimSpace(ip))
-					if err != nil {
-						return nil, fmt.Errorf("invalid AllowedIPs: %w", err)
+					if ip = strings.TrimSpace(ip); ip == "" {
+						continue
+					}
+					pfx, perr := netip.ParsePrefix(ip)
+					if perr != nil {
+						return nil, fmt.Errorf("invalid AllowedIPs: %w", perr)
 					}
 					peer.AllowedIPs = append(peer.AllowedIPs, pfx)
 				}
-
-			case "Endpoint":
-				host, portStr, err := net.SplitHostPort(val)
-				if err != nil {
-					return nil, fmt.Errorf("invalid Endpoint: %w", err)
+			case "endpoint":
+				host, portStr, serr := net.SplitHostPort(val)
+				if serr != nil {
+					return nil, fmt.Errorf("invalid Endpoint: %w", serr)
 				}
-				port, err := strconv.Atoi(portStr)
-				if err != nil {
-					return nil, fmt.Errorf("invalid Endpoint port: %w", err)
+				port, perr := strconv.ParseUint(portStr, 10, 16)
+				if perr != nil || port == 0 {
+					return nil, fmt.Errorf("invalid Endpoint port: %q", portStr)
 				}
 				peer.Address = host
 				peer.Port = uint16(port)
-
-			case "PersistentKeepalive":
-				v, _ := strconv.Atoi(val)
-				peer.PersistentKeepaliveInterval = uint16(v)
-			case "Reserved": // WARP generators write the client id so
+			case "persistentkeepalive":
+				var ka string
+				if ka, err = awgRangeValue(val); err == nil {
+					keepalives[len(keepalives)-1] = T.AwgRange(ka)
+					lower, _, _ := strings.Cut(ka, "-")
+					v, _ := strconv.ParseUint(lower, 10, 16)
+					peer.PersistentKeepaliveInterval = uint16(v)
+				}
+			case "reserved": // WARP generators write the client id so
 				for _, part := range strings.Split(val, ",") {
-					if num, err := strconv.ParseUint(strings.TrimSpace(part), 10, 8); err == nil {
+					if num, perr := strconv.ParseUint(strings.TrimSpace(part), 10, 8); perr == nil {
 						reserved = append(reserved, uint8(num))
 					}
 				}
 			}
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	if privateKey == "" {
 		return nil, errors.New("missing PrivateKey")
 	}
-
-	if peer.Address == "" || peer.Port == 0 {
-		return nil, errors.New("missing peer Endpoint")
+	if len(peers) == 0 {
+		return nil, errors.New("missing [Peer]")
 	}
-	if len(peer.AllowedIPs) == 0 {
-		peer.AllowedIPs = badoption.Listable[netip.Prefix]([]netip.Prefix{
-			netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
-		})
+	for i := range peers {
+		if peers[i].Address == "" || peers[i].Port == 0 {
+			return nil, errors.New("missing peer Endpoint")
+		}
+		if len(peers[i].AllowedIPs) == 0 {
+			peers[i].AllowedIPs = T.LegacyListable[netip.Prefix]{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+		}
 	}
-	awg := T.AwgOptions{
-		Jc:   jc,
-		Jmin: jmin,
-		Jmax: jmax,
-
-		S1: s1,
-		S2: s2,
-		S3: s3,
-		S4: s4,
-		H1: h1,
-		H2: h2,
-		H3: h3,
-		H4: h4,
-
-		I1: i1,
-		I2: i2,
-		I3: i3,
-		I4: i4,
-		I5: i5,
-
-		HeaderProtectionKey:    awg3.HeaderProtectionKey,
-		ContentPaddingAddition: awg3.ContentPaddingAddition,
-		RekeyAfterTime:         awg3.RekeyAfterTime,
-		RekeyTimeout:           awg3.RekeyTimeout,
-		RejectAfterTime:        awg3.RejectAfterTime,
-		KeepaliveTimeout:       awg3.KeepaliveTimeout,
-		MaxHandshakeAttempts:   awg3.MaxHandshakeAttempts,
-		RandomTrailers:         awg3.RandomTrailers,
-		DisableCookies:         awg3.DisableCookies,
+	if len(reserved) > 0 {
+		peers[0].Reserved = reserved
 	}
 	wg := T.WireGuardEndpointOptions{
 		PrivateKey: privateKey,
 		Address:    badoption.Listable[netip.Prefix](addresses),
 		MTU:        mtu,
-		Peers: []T.WireGuardPeer{
-			T.WireGuardPeer{
-				Address:                     peer.Address,
-				Port:                        peer.Port,
-				PreSharedKey:                peer.PresharedKey,
-				PublicKey:                   peer.PublicKey,
-				AllowedIPs:                  T.LegacyListable[netip.Prefix](peer.AllowedIPs),
-				PersistentKeepaliveInterval: peer.PersistentKeepaliveInterval,
-				Reserved:                    reserved,
-			},
-		},
+		Peers:      peers,
 	}
 	if !awg.IsAvailble() {
 		if name == "" {
@@ -268,7 +295,16 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 	if name == "" {
 		name = "awg"
 	}
-	return amneziaWireGuardEndpoint(name, wg, awg), nil
+	endpoint := amneziaWireGuardEndpoint(name, wg, awg)
+	// the keepalive as written, a range included (3.1), for the awg endpoint
+	if opts, ok := endpoint.Options.(*T.AwgEndpointOptions); ok {
+		for i := range opts.Peers {
+			if i < len(keepalives) && keepalives[i] != "" {
+				opts.Peers[i].PersistentKeepaliveInterval = keepalives[i]
+			}
+		}
+	}
+	return endpoint, nil
 }
 
 func AWGSingbox(raw string) (*T.Endpoint, error) {
@@ -350,7 +386,7 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 		PublicKey:                   linkKey(getOneOfN(u.Params, "", "peerpublickey", "publickey", "pub", "peerpub", "peerpk")),
 		PresharedKey:                linkKey(getOneOfN(u.Params, "", "presharedkey", "psk")),
 		AllowedIPs:                  allowedIPs,
-		PersistentKeepaliveInterval: uint16(toInt(getOneOfN(u.Params, "", "keepalive", "persistentkeepaliveinterval", "persistentkeepalive"))),
+		PersistentKeepaliveInterval: T.AwgRange(strings.ReplaceAll(getOneOfN(u.Params, "", "keepalive", "persistentkeepaliveinterval", "persistentkeepalive"), " ", "")),
 	}
 	pk := linkKey(getOneOfN(u.Params, "", "privatekey", "pk"))
 	if pk == "" {
@@ -408,7 +444,7 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 				PreSharedKey:                peer.PresharedKey,
 				PublicKey:                   peer.PublicKey,
 				AllowedIPs:                  T.LegacyListable[netip.Prefix](peer.AllowedIPs),
-				PersistentKeepaliveInterval: peer.PersistentKeepaliveInterval,
+				PersistentKeepaliveInterval: awgKeepaliveLower(peer.PersistentKeepaliveInterval),
 			},
 		},
 		MTU:   uint32(toInt(getOneOfN(u.Params, "1280", "mtu"))),
@@ -439,5 +475,16 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 			tag = "AWG"
 		}
 	}
-	return amneziaWireGuardEndpoint(tag, wgopts, opts.Awg), nil
+	endpoint := amneziaWireGuardEndpoint(tag, wgopts, opts.Awg)
+	if awgOpts, ok := endpoint.Options.(*T.AwgEndpointOptions); ok && len(awgOpts.Peers) == 1 {
+		awgOpts.Peers[0].PersistentKeepaliveInterval = peer.PersistentKeepaliveInterval // a range too
+	}
+	return endpoint, nil
+}
+
+// awgKeepaliveLower is the lower end of a keepalive range, for a plain WireGuard peer.
+func awgKeepaliveLower(r T.AwgRange) uint16 {
+	lower, _, _ := strings.Cut(string(r), "-")
+	v, _ := strconv.ParseUint(strings.TrimSpace(lower), 10, 16)
+	return uint16(v)
 }
